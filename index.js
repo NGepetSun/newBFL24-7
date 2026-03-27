@@ -38,7 +38,7 @@ const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK  || '';
 const RAW_IDS         = process.env.CHANNEL_IDS      || '';
 const CHECK_INTERVAL  = parseInt(process.env.CHECK_INTERVAL || '120', 10);
 const MENTION         = process.env.MENTION          || '@everyone';
-const BOT_NAME        = process.env.BOT_NAME         || 'StreamPulse';
+const BOT_NAME        = process.env.BOT_NAME         || 'NotiStream by @elvanprmn';
 const BOT_AVATAR      = process.env.BOT_AVATAR       || '';
 const PORT            = process.env.PORT             || 3000;
 
@@ -86,19 +86,20 @@ async function checkViaRSS(channelId) {
 
   if (!videoIds.length) return { isLive: false, channelName };
 
-  // Cek 3 video terbaru — apakah ada yang live sekarang
-  for (const videoId of videoIds.slice(0, 3)) {
-    const live = await checkVideoIsLive(videoId);
-    if (live) {
-      return {
-        isLive      : true,
-        videoId,
-        channelName,
-        title       : live.title,
-        streamUrl   : `https://youtu.be/${videoId}`,
-        detectedBy  : 'RSS+VideoCheck',
-      };
-    }
+  // Cek HANYA video terbaru (index 0) di RSS
+  // Live stream SELALU muncul di posisi pertama RSS saat aktif
+  // Cek lebih dari 1 video meningkatkan risiko false positive (video lama yang pernah live)
+  const latestVideoId = videoIds[0];
+  const live = await checkVideoIsLive(latestVideoId);
+  if (live) {
+    return {
+      isLive      : true,
+      videoId     : latestVideoId,
+      channelName,
+      title       : live.title,
+      streamUrl   : `https://youtu.be/${latestVideoId}`,
+      detectedBy  : 'RSS+VideoCheck',
+    };
   }
 
   return { isLive: false, channelName };
@@ -115,36 +116,64 @@ async function checkViaLivePage(channelId) {
   const r   = await axios.get(url, {
     headers      : BROWSER_HEADERS,
     timeout      : 15000,
-    maxRedirects : 5,
+    maxRedirects  : 5,
   });
   const html = r.data;
 
-  // Indikator live yang tersembunyi di HTML YouTube:
-  const liveIndicators = [
-    '"isLive":true',
-    '"liveBroadcastDetails"',
-    '"watching now"',
-    'isLiveBroadcast',
-    '"style":"LIVE"',
-    '"iconType":"LIVE"',
-    'hqdefault_live.jpg',
-  ];
+  // ── LANGKAH 1: Pastikan TIDAK ada tanda offline ──
+  const isDefinitelyOffline =
+    html.includes('"LIVE_STREAM_OFFLINE"') ||
+    html.includes('"status":"OFFLINE"')    ||
+    // Jika redirect ke halaman channel biasa (bukan video live),
+    // canonical URL tidak mengandung /watch?v=
+    (!html.includes('/watch?v=') && !html.includes('"isLive":true'));
 
-  const isLive = liveIndicators.some(indicator => html.includes(indicator));
+  if (isDefinitelyOffline) return { isLive: false };
 
-  if (!isLive) return { isLive: false };
+  // ── LANGKAH 2: Kumpulkan skor indikator live ──
+  // Setiap indikator diberi bobot — butuh skor >= 3 untuk dianggap live
+  let score = 0;
+  const reasons = [];
 
-  // Ekstrak video ID dari URL final (setelah redirect)
-  const videoIdMatch = html.match(/"videoId":"([a-zA-Z0-9_-]{11})"/);
-  const titleMatch   = html.match(/"title":"([^"]+)"/);
-  const videoId      = videoIdMatch?.[1] || null;
+  // Indikator kuat (bobot 2) — hampir pasti live jika ada
+  if (html.includes('"concurrentViewers"'))                   { score += 2; reasons.push('concurrentViewers'); }
+  if (html.includes('"isLive":true') &&
+      html.includes('"concurrentViewers"'))                   { score += 2; reasons.push('isLive+viewers'); }
+  if (/watching now/i.test(html))                            { score += 2; reasons.push('watchingNow'); }
+
+  // Indikator sedang (bobot 1) — perlu dikombinasikan
+  if (html.includes('"isLive":true'))                         { score += 1; reasons.push('isLive'); }
+  if (html.includes('"broadcastId":"') &&
+      !html.includes('"broadcastId":""'))                    { score += 1; reasons.push('broadcastId'); }
+  if (html.includes('hqdefault_live.jpg'))                    { score += 1; reasons.push('liveThumbnail'); }
+  if (html.includes('"viewerCount"'))                         { score += 1; reasons.push('viewerCount'); }
+
+  // Indikator negatif (kurangi skor) — tanda video sudah selesai
+  if (html.includes('"LIVE_STREAM_OFFLINE"'))                 { score -= 5; }
+  if (html.includes('"isUpcoming":true'))                     { score -= 3; reasons.push('isUpcoming!'); }
+
+  log('DEBUG', `[LIVE-PAGE] ${channelId} score=${score} [${reasons.join(',')}]`);
+
+  if (score < 3) return { isLive: false };
+
+  // ── LANGKAH 3: Ekstrak video ID & judul ──
+  // Cari videoId yang benar-benar terkait dengan live (bukan thumbnail related)
+  const videoIdMatch = html.match(/"videoId":"([a-zA-Z0-9_-]{11})".*?"isLive":true/) ||
+                       html.match(/"isLive":true.*?"videoId":"([a-zA-Z0-9_-]{11})"/) ||
+                       html.match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
+  const titleMatch   = html.match(/"text":"([^"]{5,100})".*?"isLive":true/) ||
+                       html.match(/<title>([^<]+)<\/title>/);
+
+  const videoId = videoIdMatch?.[1] || null;
+  const rawTitle = titleMatch?.[1] || 'Live Stream';
+  const title   = rawTitle.replace(' - YouTube','').trim();
 
   return {
     isLive    : true,
     videoId,
-    title     : titleMatch?.[1] || 'Live Stream',
+    title,
     streamUrl : videoId ? `https://youtu.be/${videoId}` : url,
-    detectedBy: 'LivePage',
+    detectedBy: `LivePage(score=${score})`,
   };
 }
 
@@ -159,16 +188,35 @@ async function checkVideoIsLive(videoId) {
     const r   = await axios.get(url, { headers: BROWSER_HEADERS, timeout: 10000 });
     const html = r.data;
 
-    const isLive = html.includes('"isLive":true') ||
-                   html.includes('"style":"LIVE"') ||
-                   html.includes('isLiveBroadcast') ||
-                   html.includes('"liveBroadcastDetails"');
+    // ── Pattern KETAT yang hanya muncul saat video sedang AKTIF live ──
+    // "isLive":true saja TIDAK cukup — juga muncul di VOD
+    // Kita butuh kombinasi: isLive:true DAN status broadcast aktif
 
-    if (!isLive) return null;
+    // Cara paling akurat: cari "status":"LIVE_STREAM_OFFLINE" — jika ada = TIDAK live
+    // Jika TIDAK ada string offline tapi ada isLive:true = sedang live
+    const isOffline = html.includes('"LIVE_STREAM_OFFLINE"') ||
+                      html.includes('"status":"OFFLINE"') ||
+                      html.includes('"broadcastId":""');
+
+    if (isOffline) return null;
+
+    // Pattern yang benar-benar spesifik untuk live aktif:
+    // "isLive":true harus berdampingan dengan "concurrentViewers" atau "watching"
+    const hasIsLiveTrue       = html.includes('"isLive":true');
+    const hasConcurrentView   = html.includes('"concurrentViewers"');
+    const hasWatchingNow      = html.includes('watching now') || html.includes('"viewerCount"');
+    const hasActiveBroadcast  = html.includes('"broadcastId":"') && !html.includes('"broadcastId":""');
+
+    // Harus ada MINIMAL 2 indikator sekaligus untuk dianggap live
+    const score = [hasIsLiveTrue, hasConcurrentView, hasWatchingNow, hasActiveBroadcast]
+                    .filter(Boolean).length;
+
+    if (score < 2) return null;
 
     const titleMatch = html.match(/<title>([^<]+)<\/title>/);
     const title      = titleMatch ? titleMatch[1].replace(' - YouTube', '').trim() : 'Live Stream';
 
+    log('DEBUG', `[VIDEO-CHECK] ${videoId} score=${score}/4 → LIVE ✅`);
     return { videoId, title };
   } catch {
     return null;
@@ -346,7 +394,7 @@ app.get('/', (req, res) => {
   </style>
 </head>
 <body>
-  <h1>📡 StreamPulse Bot <span style="color:#10b981;font-size:14px">v4</span></h1>
+  <h1>📡 NotiStream <span style="color:#10b981;font-size:14px">by @elvanprmn</span></h1>
   <div class="sub">YouTube Live → Discord · 100% Tanpa API · Auto-refresh 30s</div>
 
   <div class="notice">✅ Mode ZERO API — Tidak menggunakan YouTube Data API. Gratis selamanya, tanpa quota.</div>
@@ -379,7 +427,7 @@ app.get('/', (req, res) => {
   </div>
 
   <div style="text-align:center;color:#2a2a3d;font-size:11px;margin-top:12px">
-    StreamPulse v4 · Railway · ${stats.startedAt.toISOString().replace('T',' ').substring(0,19)} UTC
+    NotiStream by @elvanprmn · Railway · ${stats.startedAt.toISOString().replace('T',' ').substring(0,19)} UTC
   </div>
 </body>
 </html>`);
@@ -415,7 +463,7 @@ function formatUptime(s) {
 
 async function main() {
   log('START', '╔════════════════════════════════════════════╗');
-  log('START', '║  StreamPulse Bot v4 — ZERO API Mode        ║');
+  log('START', '║  NotiStream by @elvanprmn — ZERO API       ║');
   log('START', '║  RSS + Scraping | Tanpa YouTube API Key    ║');
   log('START', '╚════════════════════════════════════════════╝');
   log('INFO',  `Channels : ${CHANNEL_IDS.length > 0 ? CHANNEL_IDS.join(', ') : '⚠️ BELUM DISET — isi CHANNEL_IDS'}`);
