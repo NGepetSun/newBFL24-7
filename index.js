@@ -301,8 +301,8 @@ async function sendDiscordNotif(channelName, streamUrl, isStart) {
   if (!DISCORD_WEBHOOK) { log('WARN', 'DISCORD_WEBHOOK belum diset!'); return; }
 
   const content = isStart
-    ? `${MENTION ? MENTION + '\n' : ''}**${channelName}** is live!\n${streamUrl}`
-    : `📴 **${channelName}** has ended the stream.`;
+    ? `${MENTION ? MENTION + '\n' : ''}**${channelName}** Lagi LIVE BROTHER!\n${streamUrl}`
+    : `📴 **${channelName}** LIVE SUDAH BERAKHIR.`;
 
   const payload = { username: BOT_NAME, content };
   if (BOT_AVATAR) payload.avatar_url = BOT_AVATAR;
